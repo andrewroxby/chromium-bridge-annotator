@@ -1,25 +1,38 @@
 # chromium-bridge
 
-chromium-bridge lets coding agents drive a Chromium window from the command line, on a dedicated profile so it never touches your everyday browser or its logins.
+chromium-bridge gives a coding agent in your terminal a shared Chromium window that it can control and you can annotate. The agent opens a page beside the terminal and reloads it as it edits. You answer from the page, by clicking a button the agent built or by ⌘-clicking any element to comment on it, and your answer arrives in the agent's terminal as a prompt.
 
-Terminal agents such as Claude Code, Codex, and Pi work in text. A dashboard, a chart, a form, or a mockup you can click doesn't belong in a terminal UI. chromium-bridge gives any agent with a shell a place to render it, with no window juggling and no agent-specific plugin.
+Terminal agents such as Claude Code, Codex, and Pi work in text, and a dashboard, a chart, a form, or a mockup you can click isn't native to the terminal. chromium-bridge works with any agent that has a shell, through a CLI, with no plugin for any one agent.
 
 For example, an agent that wants you to choose between two designs writes `ui/index.html` with a button for each, then runs:
 
 ```sh
-chromium-bridge open ./ui/index.html --watch   # open the page; reload it on every save
-chromium-bridge events --wait                  # wait until the page reports your choice
+chromium-bridge open ./ui/index.html --watch   # show the page beside the terminal; reload it on every save
 ```
 
-Each button reports back through `chromiumBridge`, an object the daemon injects into every page:
+Each button reports back through `chromiumBridge`, an object chromium-bridge injects into every page:
 
 ```html
 <button onclick="chromiumBridge.send({ choice: 'b' })">Use design B</button>
 ```
 
-When you click, `events` prints `{"choice": "b"}` and the agent carries on. To click, fill, or inspect the page itself, the agent hands the tab to [agent-browser](https://github.com/vercel-labs/agent-browser).
+When you click, a one-line prompt appears in the agent's terminal. The agent reads `{"choice": "b"}` with `chromium-bridge events` and carries on. To point at something instead, ⌘-click the element, write "make this the primary button", and press Send. The agent gets the comment the same way, makes the change, and replies. The comment's pin turns green, and the reply shows under the comment in the page's tray.
 
-Tested on Ungoogled Chromium 154 on macOS.
+Tested on Ungoogled Chromium 154 on macOS, with Pi under herdr.
+
+## Why it exists
+
+Agents already have good ways to drive a browser. Chrome DevTools MCP, Playwright MCP, agent-browser, and Claude in Chrome all let an agent open pages, click, read the console, and take screenshots. They let the agent operate a browser, but they give you no way to answer the agent from the page.
+
+Existing annotation tools cover the other direction. Agentation and the stagewise toolbar let you click an element and leave a note for an agent. You add them to your own web app as a package, so they work on your app in development, and they hand notes over through an MCP server, an IDE integration, or the clipboard.
+
+chromium-bridge is for the agent already working in your terminal:
+
+- It works on any page, including a single HTML file the agent just wrote. Nothing is installed into the page's code.
+- What you send lands in the agent's own terminal pane as a prompt, through herdr or tmux. No MCP server, IDE, extension, or copy-paste step is involved, so Pi, Claude Code, and Codex all work the same way.
+- The agent answers each comment on the page. Its pin turns green, and the reply sits under your comment, tied to the element it's about.
+- Driving stays with existing tools. `chromium-bridge connect` hands any tab to agent-browser, and any CDP client can attach.
+- The window runs on its own profile, so the agent never sees your logins.
 
 ## Contents
 
@@ -45,7 +58,7 @@ Tested on Ungoogled Chromium 154 on macOS.
 ## Install
 
 ```sh
-git clone <this-repo> chromium-bridge
+git clone https://github.com/andrewroxby/chromium-bridge-annotator.git chromium-bridge
 ln -sf "$PWD/chromium-bridge/bin/chromium-bridge" ~/.local/bin/chromium-bridge   # any directory on PATH
 ```
 
