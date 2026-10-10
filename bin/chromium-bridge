@@ -1,0 +1,607 @@
+#!/usr/bin/env python3
+"""Drive a dedicated Chromium window from any shell.
+
+Talks to the chromium-bridge daemon (daemon.js, beside this folder), which
+holds a CDP connection to Chromium running on its own profile. This opens,
+reloads, watches, and closes tabs there, reads what pages send back, or
+prints a CDP WebSocket URL for a client such as agent-browser:
+
+    chromium-bridge open ./ui/index.html --watch    # reload on every save
+    chromium-bridge events --wait                   # block until the page sends
+    chromium-bridge connect my-session               # bind agent-browser to a tab
+
+Pages send with window.chromiumBridge.send(data); data must be JSON-serializable.
+
+`open` and `doctor` start the daemon, and the browser with it, when they are
+not running. The other commands need a running browser.
+"""
+
+import argparse
+import http.client
+import json
+import os
+import pathlib
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "chromium-bridge",
+)
+SOCKET = os.path.join(STATE_DIR, "daemon.sock")
+LOG_FILE = os.path.join(STATE_DIR, "daemon.log")
+TILED_FILE = os.path.join(STATE_DIR, "tiled")  # window ids `tile` tiled, for `untile`
+
+# This script is usually reached through a symlink, so resolve it first.
+DAEMON = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "daemon.js")
+
+MIN_NODE = 22
+EXIT_NO_BROWSER = 3  # daemon.js: attach-only start found no browser
+LOG_MAX_BYTES = 1_000_000  # trim daemon.log once it passes this many bytes
+LOG_KEEP_BYTES = 200_000  # ...down to roughly this many trailing bytes
+
+AEROSPACE = shutil.which("aerospace") or "/opt/homebrew/bin/aerospace"
+CHROMIUM_BUNDLE_ID = "org.chromium.Chromium"
+
+
+class BridgeError(Exception):
+    pass
+
+
+# --- Daemon ------------------------------------------------------------------
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    """HTTP over the daemon's unix socket."""
+
+    def __init__(self, path, timeout):
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+def daemon_answers():
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(SOCKET)
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def node_binary():
+    node = shutil.which("node") or "/opt/homebrew/bin/node"
+    try:
+        version = subprocess.run([node, "--version"], capture_output=True, text=True).stdout.strip()
+    except OSError:
+        raise BridgeError(f"node not found; chromium-bridge needs Node {MIN_NODE} or later") from None
+    major = int(re.match(r"v(\d+)", version).group(1)) if version.startswith("v") else 0
+    if major < MIN_NODE:
+        raise BridgeError(f"{node} is {version or 'unknown'}; chromium-bridge needs Node {MIN_NODE} or later")
+    return node
+
+
+def trim_log():
+    """Keep daemon.log private and bounded: 0600 whether it's new or already
+    existed looser, and capped to roughly the last LOG_KEEP_BYTES once it
+    grows past LOG_MAX_BYTES."""
+    try:
+        if os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            with open(LOG_FILE, "rb") as f:
+                f.seek(-LOG_KEEP_BYTES, os.SEEK_END)
+                f.readline()  # drop a partial first line
+                tail = f.read()
+            with open(LOG_FILE, "wb") as f:
+                f.write(tail)
+        os.chmod(LOG_FILE, 0o600)
+    except FileNotFoundError:
+        pass
+
+
+def ensure_daemon(launch):
+    """Start the daemon unless it already answers. With launch, it also starts
+    the browser; without, it attaches to a running browser or fails."""
+    if daemon_answers():
+        return
+    node = node_binary()
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    trim_log()
+    log_fd = os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        proc = subprocess.Popen(
+            [node, DAEMON] + (["--launch"] if launch else []),
+            stdin=subprocess.DEVNULL,
+            stdout=log_fd,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        os.close(log_fd)
+
+    # A daemon that exits 0 found another daemon starting and waited for it,
+    # so the socket answers soon after.
+    deadline = time.monotonic() + (25 if launch else 10)
+    while time.monotonic() < deadline:
+        if daemon_answers():
+            return
+        code = proc.poll()
+        if code == EXIT_NO_BROWSER:
+            raise BridgeError("no chromium-bridge browser is running; open something first")
+        if code not in (None, 0):
+            raise BridgeError(f"daemon failed to start; see {LOG_FILE}")
+        time.sleep(0.1)
+    raise BridgeError(f"daemon did not come up; see {LOG_FILE}")
+
+
+def request(method, action, body=None, timeout=45, **params):
+    query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    conn = UnixHTTPConnection(SOCKET, timeout)
+    payload = json.dumps(body).encode() if body is not None else None
+    headers = {"content-type": "application/json"} if payload is not None else {}
+    try:
+        conn.request(method, f"/{action}" + (f"?{query}" if query else ""), body=payload, headers=headers)
+        res = conn.getresponse()
+        raw = res.read()
+    except OSError as err:
+        raise BridgeError(f"daemon did not answer: {err}") from None
+    finally:
+        conn.close()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise BridgeError(f"bad reply from daemon: {raw[:200]!r}") from None
+    if res.status != 200:
+        raise BridgeError(data.get("error", f"HTTP {res.status}") if isinstance(data, dict) else str(data))
+    return data
+
+
+def call(action, timeout=45, **params):
+    return request("GET", action, timeout=timeout, **params)
+
+
+def call_post(action, body, timeout=45, **params):
+    return request("POST", action, body=body, timeout=timeout, **params)
+
+
+# --- Doorbell -----------------------------------------------------------------
+
+
+def owner_spec():
+    """This pane's identity for doorbell delivery, from the environment: herdr
+    when running under herdr, else tmux when running under tmux, else None."""
+    herdr_pane = os.environ.get("HERDR_PANE_ID")
+    if herdr_pane:
+        return {
+            "kind": "herdr",
+            "pane": herdr_pane,
+            "socket": os.environ.get("HERDR_SOCKET_PATH", ""),
+            "bin": os.environ.get("HERDR_BIN_PATH") or "herdr",
+        }
+    tmux_pane = os.environ.get("TMUX_PANE")
+    tmux_env = os.environ.get("TMUX")
+    if tmux_pane and tmux_env:
+        socket = tmux_env.split(",", 1)[0]
+        if socket:
+            return {"kind": "tmux", "pane": tmux_pane, "socket": socket}
+    return None
+
+
+# --- Targets -----------------------------------------------------------------
+
+
+FILE_EXTENSIONS = (
+    ".html", ".htm", ".md", ".svg", ".json", ".txt", ".css",
+    ".js", ".mjs", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf",
+)
+
+
+def resolve_target(arg):
+    """Turn a path or bare host into a URL. Returns (url, directory or None)."""
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", arg) or arg.startswith(("about:", "data:")):
+        return arg, None
+    path = pathlib.Path(arg).expanduser()
+    if path.exists():
+        path = path.resolve()
+        return path.as_uri(), str(path if path.is_dir() else path.parent)
+    if re.match(r"^(localhost|127\.0\.0\.1)(:\d+)?(/|$)", arg):
+        return f"http://{arg}", None
+    if arg.startswith((".", "/", "~")) or arg.lower().endswith(FILE_EXTENSIONS):
+        raise BridgeError(f"no such file: {arg}")
+    return f"https://{arg}", None
+
+
+# --- agent-browser ------------------------------------------------------------
+
+
+def agent_browser_binary():
+    binary = shutil.which("agent-browser") or "/opt/homebrew/bin/agent-browser"
+    if not os.path.isfile(binary):
+        raise BridgeError("agent-browser not found; install it or add it to PATH")
+    return binary
+
+
+def run_agent_browser(binary, session, *args, as_json=False):
+    cmd = [binary, "--session", session] + (["--json"] if as_json else []) + list(args)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise BridgeError(f"agent-browser {args[0]} failed: {detail}")
+    return result.stdout
+
+
+def same_page(a, b):
+    """Compare two URLs loosely: ignore a trailing slash and fragment."""
+
+    def strip(url):
+        return re.sub(r"#.*$", "", url).rstrip("/")
+
+    return strip(a) == strip(b)
+
+
+# --- Tiling (AeroSpace) ---------------------------------------------------
+
+
+def aerospace_run(args, timeout=10):
+    try:
+        result = subprocess.run([AEROSPACE] + args, capture_output=True, text=True, timeout=timeout)
+    except OSError as err:
+        raise BridgeError(f"aerospace not found: {err}") from None
+    except subprocess.TimeoutExpired:
+        raise BridgeError(f"aerospace {' '.join(args)} timed out") from None
+    if result.returncode != 0:
+        raise BridgeError((result.stderr or result.stdout).strip() or f"aerospace {' '.join(args)} failed")
+    return result.stdout.strip()
+
+
+def ensure_aerospace():
+    """Start AeroSpace if it isn't running, and wait until it answers."""
+    if subprocess.run(["pgrep", "-x", "AeroSpace"], capture_output=True).returncode != 0:
+        subprocess.run(["open", "-a", "AeroSpace"])
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if subprocess.run([AEROSPACE, "list-workspaces", "--focused"], capture_output=True).returncode == 0:
+            return
+        time.sleep(0.5)
+    raise BridgeError("AeroSpace not responding")
+
+
+def focused_window():
+    out = aerospace_run(["list-windows", "--focused", "--format", "%{window-id}|%{app-bundle-id}|%{app-pid}"])
+    if not out:
+        raise BridgeError("no focused window to tile beside")
+    window_id, bundle_id, pid = out.split("|")
+    return window_id, bundle_id, int(pid)
+
+
+def bridge_window(pid, title_hint):
+    """The bridge browser's window for `pid`. With several, prefer one whose
+    title starts with the active tab's title, else the first. A window that
+    was just opened can take a moment to reach AeroSpace."""
+    deadline = time.monotonic() + 3
+    while True:
+        out = aerospace_run(
+            ["list-windows", "--monitor", "all", "--pid", str(pid), "--format", "%{window-id}|%{window-title}"]
+        )
+        windows = [line.split("|", 1) for line in out.splitlines() if line]
+        if windows or time.monotonic() > deadline:
+            break
+        time.sleep(0.2)
+    if not windows:
+        return None
+    if title_hint:
+        for window_id, title in windows:
+            if title.startswith(title_hint):
+                return window_id
+    return windows[0][0]
+
+
+def window_in_workspace(window_id, workspace):
+    out = aerospace_run(["list-windows", "--workspace", workspace, "--format", "%{window-id}"])
+    return window_id in out.splitlines()
+
+
+def float_saved_pair():
+    """Float the pair `tile` saved, skipping windows that are gone. Returns
+    the ids it floated."""
+    floated = []
+    if not os.path.exists(TILED_FILE):
+        return floated
+    with open(TILED_FILE) as f:
+        ids = f.read().split()
+    for window_id in ids:
+        ok = subprocess.run([AEROSPACE, "layout", "--window-id", window_id, "floating"], capture_output=True)
+        if ok.returncode == 0:
+            floated.append(window_id)
+    os.remove(TILED_FILE)
+    return floated
+
+
+def do_tile():
+    """Tile the bridge browser's window beside the focused window, and save
+    the pair so untile can float them again. A pair tiled earlier floats
+    first, so no window is left tiled without a record."""
+    status = call("status")
+    pid = status.get("browserPid")
+    if not pid:
+        raise BridgeError("nothing to tile; open something first")
+
+    tabs = call("tabs")
+    active_title = next((t["title"] for t in tabs if t.get("active")), "")
+
+    ensure_aerospace()
+
+    # Capture the partner before anything can take focus.
+    partner_id, partner_bundle, partner_pid = focused_window()
+    if partner_bundle == CHROMIUM_BUNDLE_ID and partner_pid == pid:
+        raise BridgeError("focus the window to tile beside, not the bridge browser")
+    workspace = aerospace_run(["list-workspaces", "--focused"])
+
+    target_id = bridge_window(pid, active_title)
+    if not target_id:
+        raise BridgeError("no bridge browser window found")
+
+    float_saved_pair()
+    if not window_in_workspace(target_id, workspace):
+        aerospace_run(["move-node-to-workspace", "--window-id", target_id, workspace])
+
+    aerospace_run(["layout", "--window-id", partner_id, "tiling"])
+    aerospace_run(["layout", "--window-id", target_id, "tiling"])
+    subprocess.run([AEROSPACE, "layout", "--window-id", partner_id, "h_tiles"], capture_output=True)
+    aerospace_run(["focus", "--window-id", partner_id])
+
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    with open(TILED_FILE, "w") as f:
+        f.write(f"{partner_id} {target_id}\n")
+    return {"partner": partner_id, "bridge": target_id, "workspace": workspace}
+
+
+# --- Commands ----------------------------------------------------------------
+
+
+def cmd_open(args):
+    url, directory = resolve_target(args.target)
+    watch = None
+    if args.watch_dir:
+        watch = str(pathlib.Path(args.watch_dir).expanduser().resolve())
+    elif args.watch:
+        if not directory:
+            raise BridgeError("--watch needs --watch-dir DIR when the target is a URL")
+        watch = directory
+    ensure_daemon(launch=True)
+    owner = owner_spec()
+    tab = call("open", url=url, new="1" if args.new else None, watch=watch, owner=json.dumps(owner) if owner else None)
+    if args.tile:
+        do_tile()
+    if args.json:
+        return tab
+    notes = [n for n in ("reused" if tab.get("reused") else "", f"watching {tab['watching']}" if tab.get("watching") else "") if n]
+    return f"{tab['id']}  {tab.get('file') or tab['url']}" + (f"  ({', '.join(notes)})" if notes else "")
+
+
+def cmd_ls(args):
+    tabs = call("tabs")
+    if args.json:
+        return tabs
+    return "\n".join(
+        f"{'*' if t['active'] else ' '} {t['id']}  {t['title'] or ''}  {t.get('file') or t['url']}"
+        + (f"  [watching {t['watching']}]" if t.get("watching") else "")
+        for t in tabs
+    ) or "no browser tabs"
+
+
+def cmd_reload(args):
+    tab = call("reload", id=args.id)
+    return tab if args.json else f"reloaded {tab['id']}"
+
+
+def cmd_events(args):
+    wait = args.wait or 0
+    events = call(
+        "events",
+        timeout=wait + 15,
+        wait=wait or None,
+        tab=args.tab,
+        peek="1" if args.peek else None,
+    )
+    if args.json:
+        return events
+    return "\n".join(f"{e['tab']}  {json.dumps(e['data'])}" for e in events) or "no events"
+
+
+def cmd_notify(args):
+    if args.off:
+        result = call_post("notify", {"off": True}, id=args.tab)
+        return result if args.json else f"notify off for {result['tab']}"
+    owner = owner_spec()
+    if not owner:
+        raise BridgeError("notify needs HERDR_PANE_ID or TMUX_PANE in the environment")
+    result = call_post("notify", owner, id=args.tab)
+    return result if args.json else f"notify on for {result['tab']} ({owner['kind']} {owner['pane']})"
+
+
+def cmd_close(args):
+    result = call("close", id=args.id)
+    return result if args.json else f"closed {result['closed']}"
+
+
+def cmd_cdp_url(args):
+    result = call("cdp-url", id=args.id)
+    return result if args.json else result["url"]
+
+
+def cmd_connect(args):
+    binary = agent_browser_binary()
+    info = call("cdp-url", id=args.tab)  # {id, targetId, url: ws://...}
+    page = next((t for t in call("tabs") if t["targetId"] == info["targetId"]), None)
+    if not page:
+        raise BridgeError(f"no tab {info['id']}")
+
+    # agent-browser treats any CDP URL as a browser endpoint and binds to
+    # whichever page Chromium lists first, so connect and then switch tabs
+    # explicitly. That also overrides any stale tab agent-browser remembers
+    # from a reused session name.
+    run_agent_browser(binary, args.session, "connect", info["url"])
+    run_agent_browser(binary, args.session, "--pin-tab", "tab", info["targetId"])
+
+    out = run_agent_browser(binary, args.session, "eval", "location.href", as_json=True)
+    try:
+        seen = json.loads(out)
+    except ValueError:
+        raise BridgeError(f"bad reply from agent-browser: {out[:200]!r}") from None
+    landed = (seen.get("data") or {}).get("result")
+    if not isinstance(landed, str) or not same_page(landed, page["url"]):
+        raise BridgeError(f"connected but landed on {landed!r}, expected {page['url']!r}")
+
+    result = {"session": args.session, "id": info["id"], "targetId": info["targetId"], "url": page["url"]}
+    if args.json:
+        return result
+    return f"connected session {args.session} to {info['id']} ({page['url']})"
+
+
+def cmd_comments(args):
+    result = call("comments", id=args.tab)
+    tab, items = result["tab"], result["items"]
+    if args.json:
+        return [{**item, "tab": tab} for item in items]
+    if not items:
+        return "no comments"
+    lines = []
+    for item in items:
+        lines.append(f"{tab} {item['id']}  [{item['status']}]  {item['intent']}  {item['comment']}")
+        if item.get("reply"):
+            lines.append(f"{' ' * (len(tab) + len(item['id']) + 1)}  reply: {item['reply']}")
+    return "\n".join(lines)
+
+
+def cmd_resolve(args):
+    reply = args.reply
+    if reply is None or reply == "-":
+        if sys.stdin.isatty():
+            raise BridgeError("resolve needs a reply: pass it as an argument or pipe one via stdin")
+        reply = sys.stdin.read()
+    reply = reply.rstrip("\n")
+    result = call_post("resolve", {"reply": reply}, id=args.tab, comment=args.id)
+    return result if args.json else f"resolved {args.id}"
+
+
+def cmd_tile(args):
+    result = do_tile()
+    if args.json:
+        return result
+    return f"tiled bridge window {result['bridge']} beside {result['partner']}"
+
+
+def cmd_untile(args):
+    if not os.path.exists(TILED_FILE):
+        return {"floated": []} if args.json else "nothing to untile"
+    ensure_aerospace()
+    floated = float_saved_pair()
+    if args.json:
+        return {"floated": floated}
+    return "untiled" if floated else "nothing to untile"
+
+
+def cmd_doctor(args):
+    report = call("doctor")
+    if args.json:
+        return report
+    lines = [f"Chromium {report.get('version') or '(version unknown)'}"]
+    for s in report["steps"]:
+        lines.append(f"  {'ok  ' if s['ok'] else 'FAIL'} {s['step']}" + (f"  {s['ms']}ms" if s["ok"] else f"  {s['error']}"))
+    lines.append("healthy" if report["ok"] else "broken")
+    return "\n".join(lines)
+
+
+def main():
+    # A copy of --json on every subparser, so it works before or after the
+    # subcommand. SUPPRESS keeps an unset subcommand copy from overwriting a
+    # --json already set at the top level.
+    json_parent = argparse.ArgumentParser(add_help=False)
+    json_parent.add_argument("--json", dest="json", action="store_true", default=argparse.SUPPRESS)
+
+    parser = argparse.ArgumentParser(prog="chromium-bridge", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("open", parents=[json_parent], help="open a URL or file, reusing a tab already showing it")
+    p.add_argument("target", help="URL, file path, or host such as localhost:3000")
+    p.add_argument("--new", action="store_true", help="always open a new tab")
+    p.add_argument("--watch", action="store_true", help="reload whenever a file beside the target changes")
+    p.add_argument("--watch-dir", metavar="DIR", help="reload whenever a file under DIR changes")
+    p.add_argument("--tile", action="store_true", help="tile beside the focused window after opening")
+    sub.add_parser("ls", parents=[json_parent], help="list browser tabs")
+    p = sub.add_parser("reload", parents=[json_parent], help="reload a tab (default: the active one)")
+    p.add_argument("id", nargs="?")
+    p = sub.add_parser("events", parents=[json_parent], help="take what pages sent with window.chromiumBridge.send")
+    p.add_argument(
+        "--wait",
+        nargs="?",
+        type=int,
+        const=600,
+        metavar="SECONDS",
+        help="block until an event arrives (default and cap: 600s)",
+    )
+    p.add_argument("--tab", help="only events from this tab")
+    p.add_argument("--peek", action="store_true", help="leave the events queued")
+    p = sub.add_parser("notify", parents=[json_parent], help="register this pane for doorbell notices on a tab")
+    p.add_argument("--tab", help="tab id (default: the active tab)")
+    p.add_argument("--off", action="store_true", help="stop ringing for this tab")
+    p = sub.add_parser("close", parents=[json_parent], help="close a tab")
+    p.add_argument("id")
+    p = sub.add_parser("cdp-url", parents=[json_parent], help="CDP WebSocket URL for a tab (default: the active one)")
+    p.add_argument("id", nargs="?")
+    p = sub.add_parser("connect", parents=[json_parent], help="bind an agent-browser session to a tab")
+    p.add_argument("session", help="agent-browser session name")
+    p.add_argument("tab", nargs="?", help="tab id (default: the active tab)")
+    p = sub.add_parser("comments", parents=[json_parent], help="list annotate-mode comments on a tab")
+    p.add_argument("--tab", help="tab id (default: the active tab)")
+    p = sub.add_parser("resolve", parents=[json_parent], help="answer an annotate-mode comment")
+    p.add_argument("id", help="comment id, e.g. c1")
+    p.add_argument("reply", nargs="?", help="reply text; reads stdin when omitted or -")
+    p.add_argument("--tab", help="tab id (default: the active tab)")
+    sub.add_parser("doctor", parents=[json_parent], help="check the bridge end to end, starting the browser if needed")
+    sub.add_parser("tile", parents=[json_parent], help="tile the bridge window beside the focused window (AeroSpace)")
+    sub.add_parser("untile", parents=[json_parent], help="float the tiled pair again")
+
+    args = parser.parse_args()
+    commands = {
+        "open": cmd_open,
+        "ls": cmd_ls,
+        "reload": cmd_reload,
+        "events": cmd_events,
+        "notify": cmd_notify,
+        "close": cmd_close,
+        "cdp-url": cmd_cdp_url,
+        "connect": cmd_connect,
+        "comments": cmd_comments,
+        "resolve": cmd_resolve,
+        "doctor": cmd_doctor,
+        "tile": cmd_tile,
+        "untile": cmd_untile,
+    }
+    try:
+        # `open` starts the daemon itself, once its target checks out; `untile`
+        # must still clean up after a bridge browser that already quit.
+        if args.command not in ("open", "untile"):
+            ensure_daemon(launch=args.command == "doctor")
+        out = commands[args.command](args)
+    except BridgeError as err:
+        print(f"chromium-bridge: {err}", file=sys.stderr)
+        return 1
+    print(json.dumps(out) if args.json else out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
