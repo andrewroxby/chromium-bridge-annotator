@@ -146,6 +146,8 @@ Plain clicks always reach the page. The **Annotate** button in the corner opens 
 
 Both modifiers work on both hosts. tmux never passes Command in a mouse report, but it does pass Option, and terminal-browser forwards it as `altKey`, so a pane uses Option. In a window, Option-click also makes macOS hide the frontmost app, so ⌘ is the one to use there.
 
+In a pane every click resolves to one point per terminal cell, so the overlay runs in a coarse mode there. Its buttons grow to about a cell, and a click that lands near a button in the open popover or tray, rather than on it, goes to the nearest one.
+
 Send delivers one `events` entry:
 
 ```json
@@ -230,7 +232,7 @@ Tiling applies to the window host only. It is opt-in, through `--tile` on `open`
 - The event queue lives in memory, so a daemon restart loses queued events.
 - A daemon restart also renumbers tab ids and stops the file server, so open local pages must be reopened.
 - Active-tab detection on the window host uses page visibility, so the selected tab in a window that is covered by other windows still counts as visible.
-- Clicks in a pane land on the nearest terminal cell. That is fine for buttons and cards and too coarse for 6 px targets.
+- Clicks in a pane resolve to one point per terminal cell, since tmux has no pixel mouse mode. That is fine for buttons and cards and too coarse for 6 px targets. The overlay's own controls allow for it; a page's own small controls may need a bigger target.
 - Inside tmux, the page renders at devicePixelRatio 1, so text can look soft on a retina display. terminal-browser derives its scale from the terminal's pixel-size report, and tmux gives none.
 - Nothing draws over mosh, which drops graphics escapes.
 - Cmd chords never reach a pane, so bind Ctrl equivalents for reload, URL, find, and close-tab with `terminal-browser config set shortcuts.<command> <keys>`.

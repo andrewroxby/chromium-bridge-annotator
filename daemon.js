@@ -486,7 +486,9 @@ function forgetTab(targetId) {
 
 function controllerFor(tab) {
   if (!tab.controller) {
-    const controller = new PageController(tab.host.cdp, tab.targetId, (data) => onPageEvent(tab, data));
+    const controller = new PageController(tab.host.cdp, tab.targetId, (data) => onPageEvent(tab, data), {
+      coarse: tab.host.kind === "pane",
+    });
 
     // A failed attach is retried on next use. Callers that await `ready`
     // still see the failure.

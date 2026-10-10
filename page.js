@@ -14,7 +14,8 @@
 // same way: registered for every new document, then evaluated once into the
 // document already loaded. BOOTSTRAP's resolve and comments are thin
 // delegates, so chromiumBridge can be built and frozen before the overlay
-// loads.
+// loads. On a pane host a flag goes in first, so the overlay sizes its
+// controls for clicks that resolve to one point per terminal cell.
 
 const fs = require("node:fs");
 const path = require("node:path");
@@ -23,6 +24,7 @@ const BINDING = "__chromiumBridgeSend";
 const MAX_PAYLOAD = 1024 * 1024;
 
 const ANNOTATE_SCRIPT = fs.readFileSync(path.join(__dirname, "annotate.js"), "utf8");
+const COARSE_FLAG = "window.__chromiumBridgeCoarse = true;";
 
 const BOOTSTRAP = `(() => {
   if (window.chromiumBridge) return;
@@ -46,10 +48,11 @@ const BOOTSTRAP = `(() => {
 class PageController {
   // cdp is the daemon's browser connection; onEvent(data) receives each
   // payload the page sends.
-  constructor(cdp, targetId, onEvent) {
+  constructor(cdp, targetId, onEvent, { coarse = false } = {}) {
     this.cdp = cdp;
     this.targetId = targetId;
     this.onEvent = onEvent;
+    this.coarse = coarse;
     this.disposed = false;
     this.ready = this.attach();
   }
@@ -69,10 +72,9 @@ class PageController {
     await this.call("Page.enable");
     await this.call("Runtime.enable");
     await this.call("Runtime.addBinding", { name: BINDING });
-    await this.call("Page.addScriptToEvaluateOnNewDocument", { source: BOOTSTRAP });
-    await this.call("Page.addScriptToEvaluateOnNewDocument", { source: ANNOTATE_SCRIPT });
-    await this.call("Runtime.evaluate", { expression: BOOTSTRAP });
-    await this.call("Runtime.evaluate", { expression: ANNOTATE_SCRIPT });
+    const scripts = [BOOTSTRAP, ...(this.coarse ? [COARSE_FLAG] : []), ANNOTATE_SCRIPT];
+    for (const source of scripts) await this.call("Page.addScriptToEvaluateOnNewDocument", { source });
+    for (const expression of scripts) await this.call("Runtime.evaluate", { expression });
   }
 
   receive(msg) {

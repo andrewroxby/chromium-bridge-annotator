@@ -29,6 +29,13 @@
     var MAX_HTML_CHARS = 2048;
     var MAX_NEARBY_CHARS = 300;
 
+    // In a terminal pane every click resolves to one point per terminal
+    // cell, so a small control can sit between two rows' points. page.js
+    // sets this flag on pane hosts; the overlay then grows its controls to
+    // about a cell and routes a click that lands near a control to it.
+    var COARSE = Boolean(window.__chromiumBridgeCoarse);
+    var COARSE_REACH = 40;
+
     var STYLE_PROPS = [
       "color", "background-color", "font-size", "font-weight",
       "display", "border", "border-radius", "text-align",
@@ -384,8 +391,22 @@
       ".cb-btn-neutral{background:#3a3a3c;color:#f1f1f3;}",
       ".cb-pill{position:fixed;right:16px;bottom:16px;pointer-events:auto;display:flex;align-items:center;gap:6px;padding:7px 12px;border-radius:999px;border:none;cursor:pointer;background:rgba(28,28,30,.92);color:#f1f1f3;font-size:12px;font-weight:500;box-shadow:0 2px 10px rgba(0,0,0,.3);}",
       ".cb-pill-count{min-width:16px;height:16px;padding:0 4px;border-radius:999px;background:rgba(255,255,255,.25);font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;}",
+      ":host(.cb-coarse) .cb-popover{width:320px;}",
+      ":host(.cb-coarse) .cb-popover textarea{height:90px;font-size:13px;}",
+      ":host(.cb-coarse) .cb-intent{gap:14px;}",
+      ":host(.cb-coarse) .cb-intent button{min-height:40px;font-size:13px;}",
+      ":host(.cb-coarse) .cb-popover-actions{gap:14px;}",
+      ":host(.cb-coarse) .cb-popover-actions button{min-height:40px;padding:0 18px;font-size:13px;}",
+      ":host(.cb-coarse) .cb-tray{width:340px;}",
+      ":host(.cb-coarse) .cb-tray-item{padding:8px;}",
+      ":host(.cb-coarse) .cb-tray-actions{gap:8px;}",
+      ":host(.cb-coarse) .cb-tray-actions button{min-height:36px;min-width:44px;font-size:12px;}",
+      ":host(.cb-coarse) .cb-tray-foot button{min-height:40px;font-size:13px;}",
+      ":host(.cb-coarse) .cb-pin{width:28px;height:28px;margin-top:-27px;font-size:12px;}",
+      ":host(.cb-coarse) .cb-pill{padding:11px 16px;font-size:13px;}",
     ].join("\n");
     shadow.appendChild(style);
+    if (COARSE) host.classList.add("cb-coarse");
 
     // Paint order doubles as hit-test order for overlapping fixed elements,
     // so the pill goes last (always on top, always reachable).
@@ -504,13 +525,60 @@
     window.addEventListener("auxclick", onPickIntercept, true);
 
     window.addEventListener("click", function (e) {
-      if (!pickKey(e) || e.target === host) return;
+      if (!pickKey(e)) {
+        if (COARSE && e.target !== host && routeCoarseClick(null, e)) return;
+        return;
+      }
+      if (e.target === host) return;
       e.preventDefault();
       e.stopImmediatePropagation();
       var el = e.target;
       if (!el || el === document.documentElement || el === document.body) return;
       openPopoverForNew(el, e.clientX, e.clientY);
     }, true);
+
+    // === Coarse clicks ==========================================================
+
+    // A click that lands on no control, inside an open panel or within reach
+    // of it on the page, goes to the panel's nearest enabled button. Clicks
+    // inside the shadow are seen here; clicks that missed the panel reach
+    // the window listener above with a page element as target.
+    function openPanel() {
+      if (popoverOpen) return popover;
+      return tray.classList.contains("cb-open") ? tray : null;
+    }
+
+    function nearestControl(panel, x, y) {
+      var best = null;
+      var bestDist = COARSE_REACH;
+      panel.querySelectorAll("button:not(:disabled)").forEach(function (btn) {
+        var r = btn.getBoundingClientRect();
+        var dx = Math.max(r.left - x, 0, x - r.right);
+        var dy = Math.max(r.top - y, 0, y - r.bottom);
+        var d = Math.sqrt(dx * dx + dy * dy);
+        if (d < bestDist) { bestDist = d; best = btn; }
+      });
+      return best;
+    }
+
+    function routeCoarseClick(target, e) {
+      if (!e.isTrusted) return false;
+      var panel = openPanel();
+      if (!panel) return false;
+      if (target && (target.closest("button, textarea, input, .cb-tray-main") || !panel.contains(target))) return false;
+      var btn = nearestControl(panel, e.clientX, e.clientY);
+      if (!btn) return false;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      btn.click();
+      return true;
+    }
+
+    if (COARSE) {
+      shadow.addEventListener("click", function (e) {
+        routeCoarseClick(e.target, e);
+      }, true);
+    }
 
     // === Popover =================================================================
 
