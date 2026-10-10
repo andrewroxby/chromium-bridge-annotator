@@ -1,8 +1,8 @@
 // chromium-bridge annotate overlay: the user's click-and-comment layer.
 //
 // page.js registers this alongside the chromiumBridge bootstrap, so it loads
-// into every document chromium-bridge opens. The user holds Command and clicks
-// an element to pick it, and writes comments that collect in a tray until
+// into every document chromium-bridge opens. The user holds Command (or
+// Option, in a terminal pane) and clicks an element to pick it, and writes comments that collect in a tray until
 // they press Send. The agent resolves each comment through
 // window.chromiumBridge, which this script extends with `resolve` and
 // `comments` once it loads.
@@ -402,17 +402,25 @@
 
     // === Picker ==================================================================
     //
-    // No mode, no full-viewport catcher. Command (the Meta key) is tracked
-    // directly: held down, it shows a live hover highlight; released, the
-    // highlight disappears. A Command-click picks whatever element the
-    // click actually landed on. Ordinary clicks are never touched, so nothing
-    // here can interfere with normal use of the page.
+    // No mode, no full-viewport catcher. The pick key is tracked directly:
+    // held down, it shows a live hover highlight; released, the highlight
+    // disappears. A pick-click picks whatever element the click actually
+    // landed on. Ordinary clicks are never touched, so nothing here can
+    // interfere with normal use of the page.
     //
-    // Not Option: macOS hides the frontmost app when you Option-click into
-    // another app's window, which collapses a tiled terminal beside it.
+    // Command is the pick key in a browser window. Option is the one for a
+    // terminal pane, because the terminal never puts Command into a mouse
+    // report; it does put Option in, and a bare Option press sends nothing,
+    // so the mousemove sync below is what raises the highlight there. In a
+    // window, Option still works but macOS hides the frontmost app when you
+    // Option-click into another app's window, so Command is the one to use.
 
     var popoverOpen = false;
-    var metaHeld = false;
+    var pickHeld = false;
+
+    function pickKey(e) {
+      return e.metaKey || e.altKey;
+    }
     var lastMouse = { x: -1, y: -1 };
 
     function hideHighlight() {
@@ -438,7 +446,7 @@
     }
 
     function updateHighlightNow() {
-      if (!metaHeld || popoverOpen) { hideHighlight(); return; }
+      if (!pickHeld || popoverOpen) { hideHighlight(); return; }
       var el = document.elementFromPoint(lastMouse.x, lastMouse.y);
       if (!el || el === host || el === document.documentElement || el === document.body) { hideHighlight(); return; }
       showHighlightFor(el);
@@ -451,19 +459,20 @@
       requestAnimationFrame(function () { highlightQueued = false; updateHighlightNow(); });
     }
 
-    // Always on, cheap: just records the pointer position and keeps metaHeld
-    // in sync with the event's own metaKey. That sync is a safety net beyond
-    // the keydown/keyup tracking below, in case a keyup is ever missed (for
-    // example Command released while a different window had focus).
+    // Always on, cheap: just records the pointer position and keeps pickHeld
+    // in sync with the event's own modifiers. That sync is a safety net
+    // beyond the keydown/keyup tracking below, in case a keyup is ever missed
+    // (for example Command released while a different window had focus),
+    // and the only path in a terminal pane.
     window.addEventListener("mousemove", function (e) {
       lastMouse.x = e.clientX;
       lastMouse.y = e.clientY;
-      if (e.metaKey !== metaHeld) { metaHeld = e.metaKey; updateHighlightNow(); return; }
-      if (metaHeld) scheduleHighlightUpdate();
+      if (pickKey(e) !== pickHeld) { pickHeld = pickKey(e); updateHighlightNow(); return; }
+      if (pickHeld) scheduleHighlightUpdate();
     }, true);
 
     window.addEventListener("keydown", function (e) {
-      if (e.key === "Meta" && !metaHeld) { metaHeld = true; updateHighlightNow(); }
+      if ((e.key === "Meta" || e.key === "Alt") && !pickHeld) { pickHeld = true; updateHighlightNow(); }
       if (popoverOpen) {
         if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closePopover(); return; }
         if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); e.stopPropagation(); submitPopover(); }
@@ -471,31 +480,31 @@
     }, true);
 
     window.addEventListener("keyup", function (e) {
-      if (e.key === "Meta") { metaHeld = false; hideHighlight(); }
+      if (e.key === "Meta" || e.key === "Alt") { pickHeld = false; hideHighlight(); }
     }, true);
 
-    window.addEventListener("blur", function () { metaHeld = false; hideHighlight(); });
+    window.addEventListener("blur", function () { pickHeld = false; hideHighlight(); });
     document.addEventListener("visibilitychange", function () {
-      if (document.hidden) { metaHeld = false; hideHighlight(); }
+      if (document.hidden) { pickHeld = false; hideHighlight(); }
     });
 
     // Swallows the gesture at the earliest possible point (capture on
     // window, ahead of document and the real target) so the page's own
     // listeners for these never run, and preventDefault blocks Chromium's
-    // own default actions for a Command-held click, such as opening a link
-    // in a new tab. Our own UI (host, via shadow retargeting) is
-    // exempt so plain clicks on the pill or tray keep working normally.
-    function onMetaIntercept(e) {
-      if (!e.metaKey || e.target === host) return;
+    // own default actions for a pick-held click, such as opening a link in
+    // a new tab or downloading it. Our own UI (host, via shadow retargeting)
+    // is exempt so plain clicks on the pill or tray keep working normally.
+    function onPickIntercept(e) {
+      if (!pickKey(e) || e.target === host) return;
       e.preventDefault();
       e.stopImmediatePropagation();
     }
-    window.addEventListener("pointerdown", onMetaIntercept, true);
-    window.addEventListener("mousedown", onMetaIntercept, true);
-    window.addEventListener("auxclick", onMetaIntercept, true);
+    window.addEventListener("pointerdown", onPickIntercept, true);
+    window.addEventListener("mousedown", onPickIntercept, true);
+    window.addEventListener("auxclick", onPickIntercept, true);
 
     window.addEventListener("click", function (e) {
-      if (!e.metaKey || e.target === host) return;
+      if (!pickKey(e) || e.target === host) return;
       e.preventDefault();
       e.stopImmediatePropagation();
       var el = e.target;
@@ -810,7 +819,7 @@
     // === Entry: pill ============================================================
 
     function buildPill() {
-      var el = h("button", { type: "button", class: "cb-pill", title: "\u2318-click to comment" });
+      var el = h("button", { type: "button", class: "cb-pill", title: "\u2318-click (\u2325-click in a pane) to comment" });
       el.appendChild(h("span", { text: "Annotate" }));
       var count = h("span", { class: "cb-pill-count" });
       count.style.display = "none";

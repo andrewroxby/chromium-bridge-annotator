@@ -1,25 +1,33 @@
 // chromium-bridge daemon: the resident process behind bin/chromium-bridge.
 //
-// It holds one browser-level CDP connection to Chromium running on a
-// dedicated profile, and attaches a PageController (page.js) to every page
-// tab. Through those sessions it reloads and navigates tabs, and carries
-// window.chromiumBridge.send(data) from pages into an in-memory event queue.
-// It also watches folders for changes and serves local files over http.
+// It holds a browser-level CDP connection to each host browser and attaches
+// a PageController (page.js) to every page tab. Through those sessions it
+// reloads and navigates tabs, and carries window.chromiumBridge.send(data)
+// from pages into an in-memory event queue. It also watches folders for
+// changes and serves local files over http.
 //
-// The daemon lives exactly as long as the browser. When Chromium quits, the
-// CDP connection closes, and the daemon cleans up and exits.
+// Two kinds of host. A pane host is a terminal-browser instance, drawn
+// inside a tmux pane; the daemon finds them through `terminal-browser ls`
+// and never starts one itself, since that needs the caller's tty. The
+// window host is Chromium on a dedicated profile, which the daemon launches
+// on demand. The daemon lives while any host does and exits a minute after
+// the last one goes.
 //
 // Start modes:
-//   node daemon.js --launch   attach to the profile's browser, launching it if needed
-//   node daemon.js            attach only; exit 3 when no bridge browser is running
+//   node daemon.js --idle-ok  start even with no host running, and wait for one
+//   node daemon.js            attach only; exit 3 when no host is running
 //
 // The CLI speaks HTTP over a unix socket in the state folder. The socket is
-// mode 0600, so its file permissions are the only auth. Routes:
-//   status            browser and tab summary
+// mode 0600, so its file permissions are the only auth. Every route takes
+// window=SESSION:@ID, the caller's tmux window, which scopes "the active
+// tab" to the pane host there. Routes:
+//   status            hosts and tab count
 //   open?url=         open a page; reuses a tab already showing it unless
-//     &new=1            new=1. watch=DIR reloads the tab whenever a file
-//     &watch=DIR        under DIR changes. owner=JSON registers the caller's
-//     &owner=JSON       pane as the tab's doorbell owner
+//     &host=            new=1. host=pane (default) or window. watch=DIR
+//     &new=1            reloads the tab whenever a file under DIR changes.
+//     &watch=DIR        owner=JSON registers the caller's pane as the tab's
+//     &owner=JSON       doorbell owner. With no pane host in the window,
+//                       answers {launch: true, url} for the CLI to start one
 //   tabs              open page tabs, each with its registered owner
 //   reload?id=        reload a tab (default: the active one)
 //   close?id=         close a tab
@@ -32,7 +40,8 @@
 //   notify?id=        POST an owner {kind, pane, socket, bin?} to register
 //                     for doorbell notices on a tab (default: the active
 //                     one), or {off: true} to stop ringing for it
-//   doctor            open a background tab, prove CDP and the channel, close it
+//   doctor            prove CDP and the channel on the pane host in the
+//                     window, or on a background Chromium tab
 
 const http = require("node:http");
 const net = require("node:net");
@@ -70,9 +79,15 @@ const CHROMIUM_FLAGS = [
 ];
 
 const EXIT_NO_BROWSER = 3;
+const IDLE_EXIT_MS = 60000;
+const PANE_SCAN_TIMEOUT_MS = 5000;
+const CONTROL_TIMEOUT_MS = 5000;
 
-let browser; // { port, ws, product }
-let cdp;
+// A host: one browser the daemon is attached to.
+//   { id, kind: "window" | "pane", cdp, port, ws, product, pid,
+//     key?, socket?, pane?, window?, tty? }   (pane hosts, from terminal-browser ls)
+const hosts = new Map();
+let idleTimer;
 let server;
 let fileServer;
 let ownsLock = false;
@@ -82,7 +97,7 @@ const startedAt = new Date().toISOString();
 const served = new Map(); // key -> directory
 const servedKeys = new Map(); // directory -> key
 
-const tabs = new Map(); // targetId -> { targetId, id, url, title, controller, hidden, onEvent }
+const tabs = new Map(); // targetId -> { targetId, id, host, url, title, controller, hidden, onEvent, paneTab?, paneActive? }
 let nextTabId = 1; // tab ids (t1, t2, ...) follow discovery order and last the tab's life
 let lastTouched; // targetId of the tab the bridge last opened or reloaded
 
@@ -178,7 +193,59 @@ class Cdp {
   }
 }
 
-// --- Browser -----------------------------------------------------------------
+// --- Hosts -------------------------------------------------------------------
+
+function windowHost() {
+  return hosts.get("window");
+}
+
+function paneHosts() {
+  return [...hosts.values()].filter((h) => h.kind === "pane");
+}
+
+// terminal-browser names a pane's tmux window "session:@id", which is what
+// the CLI sends as window=.
+function paneHostsIn(window) {
+  return window ? paneHosts().filter((h) => h.window === window) : paneHosts();
+}
+
+async function attachHost(host) {
+  host.cdp = await Cdp.connect(host.ws);
+  host.cdp.onEvent = (msg) => onBrowserEvent(host, msg);
+  host.cdp.onClose = () => dropHost(host, "browser closed");
+  hosts.set(host.id, host);
+  clearTimeout(idleTimer);
+  await host.cdp.send("Target.setDiscoverTargets", { discover: true });
+  log(`attached ${host.id}: ${host.product} on port ${host.port}`);
+  return host;
+}
+
+function dropHost(host, reason) {
+  if (hosts.get(host.id) !== host) return;
+  hosts.delete(host.id);
+  for (const tab of [...tabs.values()]) if (tab.host === host) forgetTab(tab.targetId);
+  log(`dropped ${host.id}: ${reason}`);
+  if (hosts.size === 0) armIdleExit();
+}
+
+function armIdleExit() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    if (hosts.size === 0) shutdown("no browser for 60s");
+  }, IDLE_EXIT_MS);
+}
+
+// --- Window host: Chromium ----------------------------------------------------
+
+async function attachChromium(launch) {
+  if (windowHost()) return windowHost();
+  let found = await findBrowser();
+  if (!found) {
+    if (!launch) return undefined;
+    found = await launchBrowser();
+  }
+  return attachHost({ id: "window", kind: "window", ...found, pid: findBrowserPid() });
+}
 
 // The profile's live browser, or null. Chromium writes its debug port and
 // browser path to DevToolsActivePort; a file left by a dead browser, or a
@@ -242,16 +309,131 @@ async function launchBrowser() {
   throw new Error("Chromium never opened its debug port; is the bridge profile open in another Chromium?");
 }
 
+// --- Pane hosts: terminal-browser --------------------------------------------
+//
+// terminal-browser keeps its own registry of running instances, read through
+// `terminal-browser ls`. Each instance exposes a CDP port, used here for the
+// channel, reload, and navigate, and a control socket for the tab operations
+// its Electron does not take over CDP: Target.createTarget answers "Not
+// supported" and Target.activateTarget is a no-op there. Starting an instance
+// needs the caller's tty, so the CLI does that; the daemon only attaches.
+
+function terminalBrowserBinary() {
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    const candidate = path.join(dir, "terminal-browser");
+    if (dir && fs.existsSync(candidate)) return candidate;
+  }
+  return "/opt/homebrew/bin/terminal-browser";
+}
+
+async function listPanes() {
+  try {
+    const { stdout } = await execFileAsync(terminalBrowserBinary(), ["ls", "--all", "--json"], {
+      timeout: PANE_SCAN_TIMEOUT_MS,
+    });
+    return JSON.parse(stdout).browsers || [];
+  } catch (err) {
+    if (err.code !== "ENOENT") log("terminal-browser ls failed:", err.message);
+    return [];
+  }
+}
+
+// Attach to every terminal-browser not yet attached. One scan at a time, so
+// two commands arriving together don't attach the same instance twice.
+let paneScan;
+function scanPanes() {
+  if (!paneScan) {
+    paneScan = (async () => {
+      const seen = await listPanes();
+      await Promise.all(
+        seen.map(async (entry) => {
+          const id = `pane:${entry.key}`;
+          if (!entry.cdpPort || hosts.has(id)) return;
+          let info;
+          try {
+            const res = await fetch(`http://127.0.0.1:${entry.cdpPort}/json/version`, { signal: AbortSignal.timeout(2000) });
+            info = await res.json();
+          } catch {
+            return;
+          }
+          await attachHost({
+            id,
+            kind: "pane",
+            key: entry.key,
+            port: entry.cdpPort,
+            ws: info.webSocketDebuggerUrl,
+            product: info.Browser,
+            pid: entry.pid,
+            socket: entry.socket,
+            pane: entry.pane && entry.pane.pane,
+            window: entry.pane && entry.pane.tab,
+            tty: entry.tty,
+          }).catch((err) => log(`attach ${id} failed:`, err.message));
+        }),
+      );
+    })().finally(() => {
+      paneScan = undefined;
+    });
+  }
+  return paneScan;
+}
+
+// One request on an instance's control socket: a JSON line with an id in,
+// a JSON line back, then the browser closes the connection.
+function control(host, msg, timeoutMs = CONTROL_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const id = crypto.randomBytes(4).toString("hex");
+    const conn = net.connect(host.socket);
+    let buffer = "";
+    const timer = setTimeout(() => {
+      conn.destroy();
+      reject(new Error(`terminal-browser ${msg.cmd} timed out`));
+    }, timeoutMs);
+    conn.once("connect", () => conn.write(`${JSON.stringify({ id, ...msg })}\n`));
+    conn.on("data", (chunk) => (buffer += chunk));
+    conn.once("error", (err) => {
+      clearTimeout(timer);
+      reject(new Error(`terminal-browser ${msg.cmd}: ${err.message}`));
+    });
+    conn.once("close", () => {
+      clearTimeout(timer);
+      let reply;
+      try {
+        reply = JSON.parse(buffer.split("\n").find((line) => line.trim()) || "");
+      } catch {
+        return reject(new Error(`terminal-browser ${msg.cmd}: no reply`));
+      }
+      if (reply.ok) resolve(reply.data);
+      else reject(new Error(`terminal-browser ${msg.cmd}: ${reply.error}`));
+    });
+  });
+}
+
+// terminal-browser's own view of a pane host's tabs: its tab ids, needed to
+// select or close one, and which tab is selected. Also the surest way to
+// learn of a tab the CDP target events haven't reported yet.
+async function syncPaneTabs(host) {
+  const { tabs: list = [] } = await control(host, { cmd: "targets" });
+  for (const entry of list) {
+    if (!entry.targetId) continue;
+    const tab = trackTarget(host, { targetId: entry.targetId, type: "page", url: entry.url, title: entry.title });
+    if (!tab) continue;
+    tab.paneTab = entry.id;
+    tab.paneActive = Boolean(entry.active);
+  }
+  return list;
+}
+
 // --- Tabs --------------------------------------------------------------------
 
 function isPage(info) {
   return info.type === "page" && !info.url.startsWith("devtools://") && info.subtype !== "prerender";
 }
 
-function onBrowserEvent(msg) {
+function onBrowserEvent(host, msg) {
   const params = msg.params;
   if (msg.method === "Target.targetCreated" || msg.method === "Target.targetInfoChanged") {
-    trackTarget(params.targetInfo);
+    trackTarget(host, params.targetInfo);
   } else if (msg.method === "Target.targetDestroyed") {
     forgetTab(params.targetId);
   } else if (msg.method === "Target.detachedFromTarget") {
@@ -266,11 +448,11 @@ function onBrowserEvent(msg) {
 
 // Every page target gets a record and a PageController. That covers tabs the
 // bridge opens, tabs the user opens, and tabs other CDP clients open.
-function trackTarget(info) {
+function trackTarget(host, info) {
   if (!isPage(info)) return undefined;
   let tab = tabs.get(info.targetId);
   if (!tab) {
-    tab = { targetId: info.targetId, id: `t${nextTabId++}` };
+    tab = { targetId: info.targetId, id: `t${nextTabId++}`, host };
     tabs.set(info.targetId, tab);
   }
   tab.url = info.url;
@@ -282,10 +464,12 @@ function trackTarget(info) {
 // Chromium reports a title change only with the next navigation, so listings
 // read current titles and urls first.
 async function refreshTargets() {
-  const { targetInfos } = await cdp.send("Target.getTargets");
-  for (const info of targetInfos) {
-    const tab = tabs.get(info.targetId);
-    if (tab) Object.assign(tab, { url: info.url, title: info.title });
+  for (const host of hosts.values()) {
+    const { targetInfos } = await host.cdp.send("Target.getTargets").catch(() => ({ targetInfos: [] }));
+    for (const info of targetInfos) {
+      const tab = tabs.get(info.targetId);
+      if (tab) Object.assign(tab, { url: info.url, title: info.title });
+    }
   }
 }
 
@@ -302,7 +486,7 @@ function forgetTab(targetId) {
 
 function controllerFor(tab) {
   if (!tab.controller) {
-    const controller = new PageController(cdp, tab.targetId, (data) => onPageEvent(tab, data));
+    const controller = new PageController(tab.host.cdp, tab.targetId, (data) => onPageEvent(tab, data));
 
     // A failed attach is retried on next use. Callers that await `ready`
     // still see the failure.
@@ -323,11 +507,16 @@ function findTab(id) {
   return publicTabs().find((t) => t.id === id);
 }
 
+function hostLabel(host) {
+  return host.kind === "window" ? "window" : host.pane || host.id;
+}
+
 function describeTab(tab, active) {
   const watching = watchers.get(tab.targetId);
   return {
     id: tab.id,
     targetId: tab.targetId,
+    host: hostLabel(tab.host),
     url: tab.url,
     title: tab.title,
     active: tab === active,
@@ -337,15 +526,39 @@ function describeTab(tab, active) {
   };
 }
 
+// The tab a command means when it names none. Pane hosts in the caller's
+// tmux window come first, then the Chromium window, then any pane host.
+// Within each tier the last-touched tab wins ties.
+async function activeTab(window) {
+  const tiers = window
+    ? [paneHostsIn(window), [windowHost()], paneHosts()]
+    : [paneHosts(), [windowHost()]];
+  for (const tier of tiers) {
+    const members = tier.filter(Boolean);
+    if (!members.length) continue;
+    const tab = members[0].kind === "pane" ? await activePaneTab(members) : await activeWindowTab();
+    if (tab) return tab;
+  }
+  return undefined;
+}
+
+const prefer = (list) => list.find((t) => t.targetId === lastTouched) || list[list.length - 1];
+
+// terminal-browser knows which of its tabs is selected.
+async function activePaneTab(members) {
+  await Promise.all(members.map((h) => syncPaneTabs(h).catch(() => {})));
+  const candidates = publicTabs().filter((t) => members.includes(t.host));
+  return prefer(candidates.filter((t) => t.paneActive)) || prefer(candidates);
+}
+
 // CDP has no "selected tab" event, so ask each tab. A window's selected tab
 // is visible and the rest are hidden; the focused one also has focus. Prefer
 // focused, then visible, then the tab the bridge last touched, then the
-// newest. Within each tier, the last-touched tab wins ties.
-async function activeTab() {
-  const candidates = publicTabs();
+// newest.
+async function activeWindowTab() {
+  const candidates = publicTabs().filter((t) => t.host.kind === "window");
   if (!candidates.length) return undefined;
   const states = await Promise.all(candidates.map(pageState));
-  const prefer = (list) => list.find((t) => t.targetId === lastTouched) || list[list.length - 1];
   return (
     prefer(candidates.filter((_, i) => states[i].focused)) ||
     prefer(candidates.filter((_, i) => states[i].visible)) ||
@@ -368,21 +581,53 @@ async function pageState(tab) {
   }
 }
 
-async function tabOrActive(id) {
-  const tab = id ? findTab(id) : await activeTab();
+async function tabOrActive(id, window) {
+  const tab = id ? findTab(id) : await activeTab(window);
   if (!tab) throw httpError(404, id ? `no tab ${id}` : "no browser tabs");
   return tab;
 }
 
-// A background tab in the last active window. With no page open there may be
-// no window at all, and createTarget then needs newWindow to make one.
-async function newTab() {
-  const { targetId } = await cdp.send("Target.createTarget", {
-    url: "about:blank",
-    background: true,
-    newWindow: tabs.size === 0,
-  });
-  return trackTarget({ targetId, type: "page", url: "about:blank", title: "" });
+// A blank tab on the host, ready to navigate once its controller attaches.
+// In Chromium that is a background tab in the last active window; with no
+// page open there may be no window at all, and createTarget then needs
+// newWindow to make one. In terminal-browser the control socket opens it,
+// and its CDP target can take a moment to appear.
+async function newTab(host) {
+  if (host.kind === "window") {
+    const { targetId } = await host.cdp.send("Target.createTarget", {
+      url: "about:blank",
+      background: true,
+      newWindow: !publicTabs().some((t) => t.host === host),
+    });
+    return trackTarget(host, { targetId, type: "page", url: "about:blank", title: "" });
+  }
+  const { openedTab } = await control(host, { cmd: "open-tab", url: "about:blank" });
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const list = await syncPaneTabs(host);
+    const entry = list.find((e) => e.id === openedTab && e.targetId);
+    if (entry) return tabs.get(entry.targetId);
+    await sleep(100);
+  }
+  throw httpError(500, `terminal-browser never reported tab ${openedTab}`);
+}
+
+async function selectTab(tab) {
+  if (tab.host.kind === "window") {
+    await tab.host.cdp.send("Target.activateTarget", { targetId: tab.targetId }).catch(() => {});
+  } else if (tab.paneTab !== undefined) {
+    await control(tab.host, { cmd: "activate-tab", tab: tab.paneTab }).catch(() => {});
+  }
+}
+
+async function closeTab(tab) {
+  if (tab.host.kind === "window") {
+    await tab.host.cdp.send("Target.closeTarget", { targetId: tab.targetId });
+    return;
+  }
+  if (tab.paneTab === undefined) await syncPaneTabs(tab.host);
+  await control(tab.host, { cmd: "close-tab", tab: tab.paneTab });
+  forgetTab(tab.targetId);
 }
 
 // --- HTTP routes -------------------------------------------------------------
@@ -391,14 +636,22 @@ async function route(req) {
   const url = new URL(req.url, "http://x");
   const action = url.pathname.slice(1);
   const param = (name) => url.searchParams.get(name);
+  const window = param("window") || undefined;
 
   if (action === "status") {
+    await scanPanes();
     return {
       pid: process.pid,
-      port: browser.port,
-      browser: browser.product,
-      browserPid: browser.pid,
       startedAt,
+      hosts: [...hosts.values()].map((h) => ({
+        id: h.id,
+        kind: h.kind,
+        port: h.port,
+        browser: h.product,
+        pid: h.pid,
+        pane: h.pane || null,
+        window: h.window || null,
+      })),
       tabs: publicTabs().length,
     };
   }
@@ -406,26 +659,28 @@ async function route(req) {
   if (action === "open") {
     const target = param("url") || "about:blank";
     const owner = parseOwnerParam(param("owner"));
-    return serially(() => openTab(target, { fresh: param("new") === "1", watch: param("watch"), owner }));
+    const hostKind = param("host") === "window" ? "window" : "pane";
+    return serially(() => openTab(target, { hostKind, window, fresh: param("new") === "1", watch: param("watch"), owner }));
   }
 
   if (action === "tabs") {
+    await scanPanes();
     await refreshTargets();
-    const active = await activeTab();
+    const active = await activeTab(window);
     return publicTabs().map((t) => describeTab(t, active));
   }
 
   if (action === "reload") {
-    const tab = await tabOrActive(param("id"));
+    const tab = await tabOrActive(param("id"), window);
     await controllerFor(tab).reload();
     lastTouched = tab.targetId;
-    return describeTab(tab, await activeTab());
+    return describeTab(tab, await activeTab(window));
   }
 
   if (action === "close") {
     const tab = findTab(param("id"));
     if (!tab) throw httpError(404, `no tab ${param("id")}`);
-    await cdp.send("Target.closeTarget", { targetId: tab.targetId });
+    await closeTab(tab);
     return { closed: tab.id };
   }
 
@@ -435,21 +690,21 @@ async function route(req) {
   }
 
   if (action === "cdp-url") {
-    const tab = await tabOrActive(param("id"));
+    const tab = await tabOrActive(param("id"), window);
     return {
       id: tab.id,
       targetId: tab.targetId,
-      url: `ws://127.0.0.1:${browser.port}/devtools/page/${tab.targetId}`,
+      url: `ws://127.0.0.1:${tab.host.port}/devtools/page/${tab.targetId}`,
     };
   }
 
   if (action === "comments") {
-    const tab = await tabOrActive(param("id"));
+    const tab = await tabOrActive(param("id"), window);
     return { tab: tab.id, items: await evalOverlay(tab, "comments", []) };
   }
 
   if (action === "resolve") {
-    const tab = await tabOrActive(param("id"));
+    const tab = await tabOrActive(param("id"), window);
     const commentId = param("comment");
     if (!commentId) throw httpError(400, "missing comment id");
     const { reply } = await readJsonBody(req);
@@ -459,7 +714,8 @@ async function route(req) {
   }
 
   if (action === "notify") {
-    const tab = await tabOrActive(param("id"));
+    await scanPanes();
+    const tab = await tabOrActive(param("id"), window);
     const body = await readJsonBody(req);
     if (body && body.off) {
       tabOwners.set(tab.id, null);
@@ -471,7 +727,7 @@ async function route(req) {
     return { tab: tab.id, owner };
   }
 
-  if (action === "doctor") return doctor();
+  if (action === "doctor") return serially(() => doctor(window));
 
   throw httpError(404, `unknown action: ${action}`);
 }
@@ -540,25 +796,43 @@ function sameUrl(a, b) {
 
 // New tabs open on about:blank and navigate once the page controller is
 // attached, so window.chromiumBridge exists before the page's own scripts run.
-async function openTab(target, { fresh, watch, owner }) {
+//
+// The pane host is the terminal-browser in the caller's tmux window. With
+// none there, the answer is {launch: true, url}: the CLI starts one on
+// about:blank from its own pane and asks again, and that blank tab is the
+// one taken over here.
+async function openTab(target, { hostKind, window, fresh, watch, owner }) {
   if (watch && !isDirectory(watch)) throw httpError(400, `not a directory: ${watch}`);
   if (target.startsWith("file:")) target = await servedUrl(target);
 
-  const key = pageKey(target);
-  const matches = fresh ? [] : publicTabs().filter((t) => pageKey(t.url) === key);
-  const reusable = matches.find((t) => t.targetId === lastTouched) || matches[matches.length - 1];
+  let host;
+  if (hostKind === "window") {
+    host = await attachChromium(true);
+  } else {
+    await scanPanes();
+    const inWindow = paneHostsIn(window);
+    host = inWindow.find((h) => [...tabs.values()].some((t) => t.host === h && t.targetId === lastTouched)) || inWindow[inWindow.length - 1];
+    if (!host) return { launch: true, url: target };
+    await syncPaneTabs(host);
+  }
 
-  let tab = reusable;
-  if (tab) {
+  const mine = publicTabs().filter((t) => t.host === host);
+  const key = pageKey(target);
+  const matches = fresh ? [] : mine.filter((t) => pageKey(t.url) === key);
+  const reusable = prefer(matches);
+  const blank = !reusable && host.kind === "pane" ? mine.find((t) => t.url === "about:blank") : undefined;
+
+  let tab = reusable || blank;
+  if (reusable) {
     const controller = controllerFor(tab);
     if (sameUrl(tab.url, target)) await controller.reload();
     else await controller.navigate(target);
   } else {
-    tab = await newTab();
+    if (!tab) tab = await newTab(host);
     try {
       await controllerFor(tab).navigate(target);
     } catch (err) {
-      await cdp.send("Target.closeTarget", { targetId: tab.targetId }).catch(() => {});
+      await closeTab(tab).catch(() => {});
       throw err;
     }
   }
@@ -573,9 +847,9 @@ async function openTab(target, { fresh, watch, owner }) {
   // Select the tab in its window, never on a watch-triggered reload. A
   // fresh getTargets call picks up the title Chromium has settled on by now,
   // where cheap; a title mid-navigation isn't worth reporting as current.
-  await cdp.send("Target.activateTarget", { targetId: tab.targetId }).catch(() => {});
+  await selectTab(tab);
   await refreshTargets();
-  const described = describeTab(tab, await activeTab());
+  const described = describeTab(tab, await activeTab(window));
   if (!tab.title) delete described.title;
   return { ...described, reused: Boolean(reusable) };
 }
@@ -1013,10 +1287,12 @@ async function deliverTmux(owner, text) {
 
 // --- Doctor ------------------------------------------------------------------
 
-// Prove the whole path on a hidden background tab: browser answers, open,
-// attach, CDP round-trip, a send through the channel, close. Each step
-// reports how long it took. The doctor's own event never reaches the queue.
-async function doctor() {
+// Prove the whole path: browser answers, attach, CDP round-trip, a send
+// through the channel. On the pane host in the caller's window that runs on
+// its selected tab and changes nothing; with no pane host it runs on a
+// hidden Chromium tab, launching Chromium if needed. Each step reports how
+// long it took. The doctor's own event never reaches the queue.
+async function doctor(window) {
   const steps = [];
   const timed = async (name, fn) => {
     const start = Date.now();
@@ -1030,23 +1306,34 @@ async function doctor() {
     }
   };
 
+  await scanPanes();
+  const pane = paneHostsIn(window)[0] || (window ? undefined : paneHosts()[0]);
+  let host = pane;
   let tab;
   let version;
   try {
-    await timed("browser", async () => {
-      if (!(await findBrowser())) throw new Error("debug port did not answer");
-    });
-    tab = await timed("open", newTab);
-    tab.hidden = true;
-    await timed("attach", () => tab.controller.ready);
+    if (pane) {
+      tab = await timed("browser", () => activePaneTab([pane]));
+      if (!tab) throw new Error("no tab in the pane");
+    } else {
+      host = await timed("browser", () => attachChromium(true));
+      tab = await timed("open", () => newTab(host));
+      tab.hidden = true;
+    }
+    await timed("attach", () => controllerFor(tab).ready);
     version = await timed("cdp-roundtrip", () => tab.controller.command("Browser.getVersion"));
     await timed("channel", () => channelRoundTrip(tab));
   } catch {
     // The failing step is already in `steps`.
   } finally {
-    if (tab) await timed("close", () => cdp.send("Target.closeTarget", { targetId: tab.targetId })).catch(() => {});
+    if (tab && tab.hidden) await timed("close", () => closeTab(tab)).catch(() => {});
   }
-  return { ok: steps.every((s) => s.ok), version: version ? version.product : browser.product, steps };
+  return {
+    ok: steps.every((s) => s.ok),
+    host: host ? hostLabel(host) : null,
+    version: version ? version.product : host && host.product,
+    steps,
+  };
 }
 
 async function channelRoundTrip(tab) {
@@ -1060,11 +1347,15 @@ async function channelRoundTrip(tab) {
       }
     };
   });
-  const { exceptionDetails } = await tab.controller.command("Runtime.evaluate", {
-    expression: `chromiumBridge.send({ doctor: "${nonce}" })`,
-  });
-  if (exceptionDetails) throw new Error(exceptionDetails.exception?.description || exceptionDetails.text);
-  await arrived;
+  try {
+    const { exceptionDetails } = await tab.controller.command("Runtime.evaluate", {
+      expression: `chromiumBridge.send({ doctor: "${nonce}" })`,
+    });
+    if (exceptionDetails) throw new Error(exceptionDetails.exception?.description || exceptionDetails.text);
+    await arrived;
+  } finally {
+    tab.onEvent = undefined;
+  }
 }
 
 // --- Lifecycle ---------------------------------------------------------------
@@ -1147,7 +1438,7 @@ function shutdown(reason) {
 }
 
 async function main() {
-  const launch = process.argv.includes("--launch");
+  const idleOk = process.argv.includes("--idle-ok");
   process.umask(0o077);
   fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
 
@@ -1160,21 +1451,16 @@ async function main() {
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("unhandledRejection", (err) => log("unhandled rejection:", err));
 
-  browser = await findBrowser();
-  if (!browser) {
-    if (!launch) {
+  await attachChromium(false).catch((err) => log("chromium attach failed:", err.message));
+  await scanPanes();
+  if (hosts.size === 0) {
+    if (!idleOk) {
       log("no chromium-bridge browser is running");
       fs.rmSync(LOCK_FILE, { force: true });
       return EXIT_NO_BROWSER;
     }
-    browser = await launchBrowser();
+    armIdleExit();
   }
-  browser.pid = findBrowserPid();
-
-  cdp = await Cdp.connect(browser.ws);
-  cdp.onEvent = onBrowserEvent;
-  cdp.onClose = () => shutdown("browser closed");
-  await cdp.send("Target.setDiscoverTargets", { discover: true });
 
   fs.rmSync(SOCKET, { force: true });
   server = http.createServer((req, res) => {
@@ -1187,7 +1473,7 @@ async function main() {
     server.listen(SOCKET, resolve);
   });
   fs.chmodSync(SOCKET, 0o600);
-  log(`ready: ${browser.product} on port ${browser.port}, pid ${process.pid}`);
+  log(`ready: ${hosts.size} host(s), pid ${process.pid}`);
 }
 
 main().then(

@@ -1,11 +1,13 @@
 ---
 name: chromium-bridge
-description: Show the user a GUI, HTML page, chart, or local web app in a dedicated Chromium window beside the terminal, iterate on it with live reload, collect the user's input or element-level comments from it as JSON, and drive or inspect it (snapshot, click, eval, screenshot, console) through agent-browser. Use when a visual surface beats terminal text, or when the user should answer through a form, picker, or other custom interface.
+description: Show the user a GUI, HTML page, chart, or local web app in a browser pane beside the agent in tmux (or a dedicated Chromium window), iterate on it with live reload, collect the user's input or element-level comments from it as JSON, and drive or inspect it (snapshot, click, eval, screenshot, console) through agent-browser. Use when a visual surface beats terminal text, or when the user should answer through a form, picker, or other custom interface.
 ---
 
 # chromium-bridge
 
-`chromium-bridge` opens and controls tabs in a Chromium window reserved for agents. It runs on its own profile, so it never sees the user's everyday browser or logins. `open` and `doctor` start the browser when it isn't running; every other command needs it running. The window never takes focus from the terminal.
+`chromium-bridge` opens and controls browser tabs reserved for agents. By default the page opens in a pane beside the agent, in the same tmux window: a real Chromium drawn inside the terminal. New tabs for later pages appear in that pane, so the pane stays with the agent's tmux window. `open` and `doctor` start what they need; every other command needs a browser already attached.
+
+Two exceptions use a separate Chromium window on its own profile, which never sees the user's everyday browser or logins. `open --window` opens one, and `open --tile` also tiles it beside the focused window through the AeroSpace CLI (`--tile` implies `--window`). The window never takes focus from the terminal.
 
 ## Show something and iterate
 
@@ -17,7 +19,9 @@ Reopening the same page reuses its tab; pass `--new` for a second one. Local fil
 
 For a multi-file app with its own dev server, start the server and run `chromium-bridge open localhost:PORT`; its hot reload replaces `--watch` (or use `--watch-dir SRC`).
 
-Pass `--tile` only when the user wants the page beside the terminal. Leave it floating otherwise. Tiling pairs the bridge window with the focused window, normally the agent's terminal, through the AeroSpace CLI.
+A new pane opens to the right of the agent's pane. `--split {right,left,down,up}` and `--size FRACTION` (0.2 to 0.95) change that, and they apply only when `open` creates a pane. A later `open` from the same tmux window adds a tab to the existing pane instead.
+
+Pass `--window` only when the user wants a separate Chromium window, for example for sharper text or a target smaller than a terminal cell. Add `--tile` only when they want it beside the terminal. Leave the window floating otherwise.
 
 ## Hearing from the user
 
@@ -45,7 +49,7 @@ chromium-bridge --json events --wait     # blocks until the page sends, up to 60
 
 ## Take comments on a page
 
-The user can comment on elements directly. They ⌘-click (Command-click) an element, write a comment marked Change or Question, and press Send in the corner tray. The batch arrives as one event:
+The user can comment on elements directly. In a pane they ⌥-click (Option-click) an element, and in a Chromium window they ⌘-click it. They write a comment marked Change or Question and press Send in the corner tray. The batch arrives as one event:
 
 ```sh
 chromium-bridge --json events --wait    # [{"data": {"type": "comments", "items": [...]}}]
@@ -58,7 +62,7 @@ chromium-bridge resolve c1 "Done: made the button primary"
 chromium-bridge comments      # ids, statuses, replies, to confirm it took
 ```
 
-Answer Question items with a reply rather than a change. Comments survive `--watch` reloads, so resolve after your edit has reloaded the page. To invite comments, tell the user to ⌘-click elements and press Send; a registered pane gets a doorbell prompt once they do, so waiting on `events` is optional. Both commands act on the active tab by default. With several tabs open, pass the event's `tab` value as `--tab`.
+Answer Question items with a reply rather than a change. Comments survive `--watch` reloads, so resolve after your edit has reloaded the page. To invite comments, tell the user to "⌥-click (Option-click) an element" in a pane or "⌘-click" in a window, then press Send. `chromium-bridge ls` shows which one applies in its host column (`window`, or a tmux pane id such as `%158`); a registered pane gets a doorbell prompt once they do, so waiting on `events` is optional. Both commands act on the active tab by default, which is scoped to this tmux window: the pane host here first, then the Chromium window, then any pane host. With several tabs open, pass the event's `tab` value as `--tab`.
 
 ## Drive or inspect a page
 
@@ -79,21 +83,21 @@ If an agent-browser call fails (`tab_gone`, most often) or acts on the wrong pag
 
 | Command | Effect |
 |---|---|
-| `chromium-bridge ls` | Tabs in the bridge window, `*` marks the active one |
+| `chromium-bridge ls` | Tabs on every host, with a host column (`window`, or a tmux pane id); `*` marks the active one |
 | `chromium-bridge reload [ID]` | Reload a tab (default: the active one) |
 | `chromium-bridge close ID` | Close a tab |
 | `chromium-bridge cdp-url [ID]` | CDP WebSocket URL for a tab (default: the active one) |
 | `chromium-bridge comments [--tab ID]` | List annotate-mode comments on a tab |
 | `chromium-bridge resolve ID [REPLY] [--tab ID]` | Answer an annotate-mode comment |
 | `chromium-bridge notify [--tab ID] [--off]` | Register this pane for doorbell notices on a tab, or stop them |
-| `chromium-bridge doctor` | End-to-end health check, starting the browser if needed |
-| `chromium-bridge tile` / `untile` | Tile or float the bridge window beside the focused window |
+| `chromium-bridge doctor` | End-to-end health check of the pane host in this tmux window, or of the Chromium window if there is none |
+| `chromium-bridge tile` / `untile` | Tile or float the Chromium window beside the focused window |
 
 Every command takes `--json`.
 
 ## Cleanup
 
-Close scratch tabs once they've served their purpose; leave tabs the user is still using. Run `chromium-bridge untile` once the task is done if the session tiled the window.
+Close scratch tabs once they've served their purpose; leave tabs the user is still using. Run `chromium-bridge untile` once the task is done if the session tiled a window. Closing the pane itself, or ctrl+q or ctrl+c inside it, quits that browser.
 
 ## When not to use it
 

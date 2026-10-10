@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Drive a dedicated Chromium window from any shell.
+"""Drive a Chromium in a tmux pane (or a dedicated window) from any shell.
 
 Talks to the chromium-bridge daemon (daemon.js, beside this folder), which
-holds a CDP connection to Chromium running on its own profile. This opens,
-reloads, watches, and closes tabs there, reads what pages send back, or
-prints a CDP WebSocket URL for a client such as agent-browser:
+holds CDP connections to terminal-browser panes, or with --window to
+Chromium running on its own profile. This opens, reloads, watches, and
+closes tabs there, reads what pages send back, or prints a CDP WebSocket
+URL for a client such as agent-browser:
 
     chromium-bridge open ./ui/index.html --watch    # reload on every save
     chromium-bridge events --wait                   # block until the page sends
@@ -12,7 +13,7 @@ prints a CDP WebSocket URL for a client such as agent-browser:
 
 Pages send with window.chromiumBridge.send(data); data must be JSON-serializable.
 
-`open` and `doctor` start the daemon, and the browser with it, when they are
+`open` and `doctor` start the daemon, and a browser with it, when they are
 not running. The other commands need a running browser.
 """
 
@@ -47,6 +48,7 @@ LOG_KEEP_BYTES = 200_000  # ...down to roughly this many trailing bytes
 
 AEROSPACE = shutil.which("aerospace") or "/opt/homebrew/bin/aerospace"
 CHROMIUM_BUNDLE_ID = "org.chromium.Chromium"
+TERMINAL_BROWSER = shutil.which("terminal-browser") or "/opt/homebrew/bin/terminal-browser"
 
 
 class BridgeError(Exception):
@@ -109,9 +111,10 @@ def trim_log():
         pass
 
 
-def ensure_daemon(launch):
-    """Start the daemon unless it already answers. With launch, it also starts
-    the browser; without, it attaches to a running browser or fails."""
+def ensure_daemon(idle_ok):
+    """Start the daemon unless it already answers. With idle_ok, the daemon
+    starts without a host browser and waits for one; without, it attaches to
+    a running browser or fails."""
     if daemon_answers():
         return
     node = node_binary()
@@ -120,7 +123,7 @@ def ensure_daemon(launch):
     log_fd = os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         proc = subprocess.Popen(
-            [node, DAEMON] + (["--launch"] if launch else []),
+            [node, DAEMON] + (["--idle-ok"] if idle_ok else []),
             stdin=subprocess.DEVNULL,
             stdout=log_fd,
             stderr=subprocess.STDOUT,
@@ -131,7 +134,7 @@ def ensure_daemon(launch):
 
     # A daemon that exits 0 found another daemon starting and waited for it,
     # so the socket answers soon after.
-    deadline = time.monotonic() + (25 if launch else 10)
+    deadline = time.monotonic() + (25 if idle_ok else 10)
     while time.monotonic() < deadline:
         if daemon_answers():
             return
@@ -144,7 +147,33 @@ def ensure_daemon(launch):
     raise BridgeError(f"daemon did not come up; see {LOG_FILE}")
 
 
+_tmux_window = None
+
+
+def tmux_window():
+    """The caller's tmux window as "session:@id", or None outside tmux.
+    Computed once per process."""
+    global _tmux_window
+    if _tmux_window is None:
+        _tmux_window = ""
+        pane = os.environ.get("TMUX_PANE")
+        if pane and os.environ.get("TMUX"):
+            try:
+                result = subprocess.run(
+                    ["tmux", "display", "-p", "-t", pane, "#{session_name}:#{window_id}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    _tmux_window = result.stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return _tmux_window or None
+
+
 def request(method, action, body=None, timeout=45, **params):
+    params.setdefault("window", tmux_window())
     query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
     conn = UnixHTTPConnection(SOCKET, timeout)
     payload = json.dumps(body).encode() if body is not None else None
@@ -332,12 +361,12 @@ def do_tile():
     the pair so untile can float them again. A pair tiled earlier floats
     first, so no window is left tiled without a record."""
     status = call("status")
-    pid = status.get("browserPid")
+    pid = next((h.get("pid") for h in status.get("hosts", []) if h.get("kind") == "window"), None)
     if not pid:
-        raise BridgeError("nothing to tile; open something first")
+        raise BridgeError("nothing to tile; open something with --window first")
 
     tabs = call("tabs")
-    active_title = next((t["title"] for t in tabs if t.get("active")), "")
+    active_title = next((t["title"] for t in tabs if t.get("active") and t.get("host") == "window"), "")
 
     ensure_aerospace()
 
@@ -369,6 +398,34 @@ def do_tile():
 # --- Commands ----------------------------------------------------------------
 
 
+def launch_pane(args):
+    """Create the first terminal-browser pane beside the caller's pane. This
+    needs the caller's tty, so the daemon cannot do it."""
+    if not os.path.isfile(TERMINAL_BROWSER):
+        raise BridgeError("terminal-browser not found; brew install --cask terminal-browser, or pass --window")
+    cmd = [TERMINAL_BROWSER, "open", "--split", args.split]
+    if args.size is not None:
+        cmd += ["--size", str(args.size)]
+    cmd.append("about:blank")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise BridgeError("terminal-browser open timed out") from None
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise BridgeError(f"terminal-browser open failed: {detail}")
+
+
+def size_fraction(text):
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid fraction: {text!r}") from None
+    if not 0.2 <= value <= 0.95:
+        raise argparse.ArgumentTypeError("must be between 0.2 and 0.95")
+    return value
+
+
 def cmd_open(args):
     url, directory = resolve_target(args.target)
     watch = None
@@ -378,9 +435,21 @@ def cmd_open(args):
         if not directory:
             raise BridgeError("--watch needs --watch-dir DIR when the target is a URL")
         watch = directory
-    ensure_daemon(launch=True)
+    ensure_daemon(idle_ok=True)
     owner = owner_spec()
-    tab = call("open", url=url, new="1" if args.new else None, watch=watch, owner=json.dumps(owner) if owner else None)
+    params = {
+        "url": url,
+        "host": "window" if args.window or args.tile else "pane",
+        "new": "1" if args.new else None,
+        "watch": watch,
+        "owner": json.dumps(owner) if owner else None,
+    }
+    tab = call("open", **params)
+    if tab.get("launch"):
+        launch_pane(args)
+        tab = call("open", **params)
+        if tab.get("launch"):
+            raise BridgeError("terminal-browser opened but the daemon could not attach to it; see daemon.log")
     if args.tile:
         do_tile()
     if args.json:
@@ -394,7 +463,7 @@ def cmd_ls(args):
     if args.json:
         return tabs
     return "\n".join(
-        f"{'*' if t['active'] else ' '} {t['id']}  {t['title'] or ''}  {t.get('file') or t['url']}"
+        f"{'*' if t['active'] else ' '} {t['id']}  {t.get('host') or ''}  {t.get('title') or ''}  {t.get('file') or t['url']}"
         + (f"  [watching {t['watching']}]" if t.get("watching") else "")
         for t in tabs
     ) or "no browser tabs"
@@ -516,7 +585,7 @@ def cmd_doctor(args):
     report = call("doctor")
     if args.json:
         return report
-    lines = [f"Chromium {report.get('version') or '(version unknown)'}"]
+    lines = [f"{report.get('host')}: {report.get('version') or '(version unknown)'}"]
     for s in report["steps"]:
         lines.append(f"  {'ok  ' if s['ok'] else 'FAIL'} {s['step']}" + (f"  {s['ms']}ms" if s["ok"] else f"  {s['error']}"))
     lines.append("healthy" if report["ok"] else "broken")
@@ -534,12 +603,15 @@ def main():
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("open", parents=[json_parent], help="open a URL or file, reusing a tab already showing it")
+    p = sub.add_parser("open", parents=[json_parent], help="open a URL or file in a terminal-browser pane (--window for a Chromium window), reusing a tab already showing it")
     p.add_argument("target", help="URL, file path, or host such as localhost:3000")
     p.add_argument("--new", action="store_true", help="always open a new tab")
     p.add_argument("--watch", action="store_true", help="reload whenever a file beside the target changes")
     p.add_argument("--watch-dir", metavar="DIR", help="reload whenever a file under DIR changes")
-    p.add_argument("--tile", action="store_true", help="tile beside the focused window after opening")
+    p.add_argument("--window", action="store_true", help="use the Chromium window host instead of a tmux pane")
+    p.add_argument("--split", choices=("right", "left", "down", "up"), default="right", help="where a new pane goes (default: right)")
+    p.add_argument("--size", type=size_fraction, metavar="FRACTION", help="new pane size, 0.2-0.95")
+    p.add_argument("--tile", action="store_true", help="tile beside the focused window after opening (implies --window)")
     sub.add_parser("ls", parents=[json_parent], help="list browser tabs")
     p = sub.add_parser("reload", parents=[json_parent], help="reload a tab (default: the active one)")
     p.add_argument("id", nargs="?")
@@ -594,7 +666,7 @@ def main():
         # `open` starts the daemon itself, once its target checks out; `untile`
         # must still clean up after a bridge browser that already quit.
         if args.command not in ("open", "untile"):
-            ensure_daemon(launch=args.command == "doctor")
+            ensure_daemon(idle_ok=args.command == "doctor")
         out = commands[args.command](args)
     except BridgeError as err:
         print(f"chromium-bridge: {err}", file=sys.stderr)
