@@ -79,6 +79,17 @@ Pick one session name per task and reuse it on every call; a name of your own ke
 
 If an agent-browser call fails (`tab_gone`, most often) or acts on the wrong page, rerun `chromium-bridge connect SESSION TAB` before retrying.
 
+A pane tab can also be driven without a session. `terminal-browser action` takes the same agent-browser commands and targets the pane browser in this tmux window and its selected tab:
+
+```sh
+terminal-browser action -- snapshot
+terminal-browser action -- click @e3
+terminal-browser action --tab 2 -- eval "document.title"   # tab ids from `terminal-browser ls`, not t1/t2
+terminal-browser action done                               # clears the "agent is acting" indicator in the pane
+```
+
+While you drive it, the pane shows that an agent is acting; run `action done` after your last command. Some pages publish WebMCP tools, which `terminal-browser action -- webmcp list --json` lists. Prefer `webmcp invoke TOOL --params 'JSON'` over clicking when a tool covers the task, and confirm with the user before invoking one marked `consequential: true`. `terminal-browser help` is the full reference. Don't run `terminal-browser setup`, which installs a vendor skill that competes with this one.
+
 ## Other commands
 
 | Command | Effect |
