@@ -21,6 +21,8 @@ For a multi-file app with its own dev server, start the server and run `chromium
 
 A new pane opens to the right of the agent's pane. `--split {right,left,down,up}` and `--size FRACTION` (0.2 to 0.95) change that, and they apply only when `open` creates a pane. A later `open` from the same tmux window adds a tab to the existing pane instead.
 
+When the user watches tmux remotely (over ssh, or from a phone client), `open` starts a new pane with inline frames by itself, from tmux's `@viewer` or an explicit `TERMINAL_BROWSER_FRAMES`. If `open` warns that an existing pane lacks them, close that pane and open again. Inline frames stutter while a page animates, so prefer still pages for remote viewers.
+
 Pass `--window` only when the user wants a separate Chromium window, for example for sharper text or a target smaller than a terminal cell. Add `--tile` only when they want it beside the terminal. Leave the window floating otherwise.
 
 ## Hearing from the user

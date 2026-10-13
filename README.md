@@ -127,6 +127,8 @@ The pane moves with its tmux window, survives Ghostty restarts, and never needs 
 - If the caller's tmux window already has a terminal-browser, the page becomes a tab there, or reuses the tab already showing it.
 - Otherwise the CLI runs `terminal-browser open --split right about:blank` from the agent's pane, and the daemon takes over the blank tab. `window.chromiumBridge` therefore exists before the page's own scripts run.
 
+A remote viewer cannot open frame files on the browser's machine, so it sees a pane only through inline frames (`TERMINAL_BROWSER_FRAMES=inline`). `open` picks the transport when it creates a pane: an explicit `TERMINAL_BROWSER_FRAMES` wins, and otherwise a tmux option `@viewer` containing `graphics=inline` (set by a viewer tracker such as Andrew's `tmux-viewer`) turns inline on. terminal-browser builds the pane from tmux's environment, not the caller's, so the CLI sets the variable in the tmux session's environment for the length of the launch and then restores it. A pane keeps the transport it started with, so when an existing pane lacks the transport the viewer needs, `open` warns and the pane has to be closed and opened again.
+
 `ls` shows each tab's host: `window`, or the tmux pane id such as `%158`.
 
 "The active tab" is scoped to the caller's tmux window, since the CLI passes the window on every call. The daemon prefers the pane host in that window, then the Chromium window, then any pane host. `doctor` checks the pane host in the caller's window if there is one, with a channel round-trip on its active tab that changes nothing. Otherwise it checks the Chromium path, launching it if needed, and it reports which host it checked.
@@ -234,7 +236,7 @@ Tiling applies to the window host only. It is opt-in, through `--tile` on `open`
 - Active-tab detection on the window host uses page visibility, so the selected tab in a window that is covered by other windows still counts as visible.
 - Clicks in a pane resolve to one point per terminal cell, since tmux has no pixel mouse mode. That is fine for buttons and cards and too coarse for 6 px targets. The overlay's own controls allow for it; a page's own small controls may need a bigger target.
 - Inside tmux, the page renders at devicePixelRatio 1, so text can look soft on a retina display. terminal-browser derives its scale from the terminal's pixel-size report, and tmux gives none.
-- Nothing draws over mosh, which drops graphics escapes.
+- Nothing draws over mosh, which drops graphics escapes. Over ssh, inline frames draw but stutter while a page animates.
 - Cmd chords never reach a pane, so bind Ctrl equivalents for reload, URL, find, and close-tab with `terminal-browser config set shortcuts.<command> <keys>`.
 - Closing the pane, or pressing ctrl+q or ctrl+c in it, quits that terminal-browser instance.
 

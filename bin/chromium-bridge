@@ -49,6 +49,7 @@ LOG_KEEP_BYTES = 200_000  # ...down to roughly this many trailing bytes
 AEROSPACE = shutil.which("aerospace") or "/opt/homebrew/bin/aerospace"
 CHROMIUM_BUNDLE_ID = "org.chromium.Chromium"
 TERMINAL_BROWSER = shutil.which("terminal-browser") or "/opt/homebrew/bin/terminal-browser"
+FRAMES_VAR = "TERMINAL_BROWSER_FRAMES"
 
 
 class BridgeError(Exception):
@@ -398,19 +399,70 @@ def do_tile():
 # --- Commands ----------------------------------------------------------------
 
 
-def launch_pane(args):
+def tmux_out(*args):
+    try:
+        result = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def wanted_frames():
+    """The frame transport a new pane should use, or None to let
+    terminal-browser probe. An explicit TERMINAL_BROWSER_FRAMES wins. Otherwise
+    tmux-viewer's @viewer decides: a viewer that cannot open this machine's
+    frame files (ssh from another Mac, Remux on the phone) reads graphics=inline."""
+    if os.environ.get(FRAMES_VAR):
+        return os.environ[FRAMES_VAR]
+    if not os.environ.get("TMUX"):
+        return None
+    viewer = tmux_out("show-option", "-gqv", "@viewer") or ""
+    return "inline" if "graphics=inline" in viewer.split() else None
+
+
+def pane_frames(pane):
+    """The TERMINAL_BROWSER_FRAMES a running pane was started with, if any."""
+    pid = tmux_out("display", "-p", "-t", pane, "#{pane_pid}")
+    if not pid:
+        return None
+    try:
+        env = subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", pid], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"(?:^|\s)" + FRAMES_VAR + r"=(\S+)", env)
+    return match.group(1) if match else None
+
+
+def launch_pane(args, frames):
     """Create the first terminal-browser pane beside the caller's pane. This
-    needs the caller's tty, so the daemon cannot do it."""
+    needs the caller's tty, so the daemon cannot do it.
+
+    terminal-browser splits the pane itself and the pane inherits tmux's
+    environment, not ours, so a frame transport travels through the session's
+    environment for the length of the launch and is then put back."""
     if not os.path.isfile(TERMINAL_BROWSER):
         raise BridgeError("terminal-browser not found; brew install --cask terminal-browser, or pass --window")
     cmd = [TERMINAL_BROWSER, "open", "--split", args.split]
     if args.size is not None:
         cmd += ["--size", str(args.size)]
     cmd.append("about:blank")
+
+    session = None
+    if frames and os.environ.get("TMUX_PANE"):
+        session = tmux_out("display", "-p", "-t", os.environ["TMUX_PANE"], "#{session_id}")
+    previous = tmux_out("show-environment", "-t", session, FRAMES_VAR) if session else None
+    if session:
+        tmux_out("set-environment", "-t", session, FRAMES_VAR, frames)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
         raise BridgeError("terminal-browser open timed out") from None
+    finally:
+        if session:
+            if previous and previous.startswith(FRAMES_VAR + "="):
+                tmux_out("set-environment", "-t", session, FRAMES_VAR, previous.split("=", 1)[1])
+            else:
+                tmux_out("set-environment", "-t", session, "-u", FRAMES_VAR)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise BridgeError(f"terminal-browser open failed: {detail}")
@@ -444,17 +496,31 @@ def cmd_open(args):
         "watch": watch,
         "owner": json.dumps(owner) if owner else None,
     }
+    frames = None if params["host"] == "window" else wanted_frames()
     tab = call("open", **params)
     if tab.get("launch"):
-        launch_pane(args)
+        launch_pane(args, frames)
         tab = call("open", **params)
         if tab.get("launch"):
             raise BridgeError("terminal-browser opened but the daemon could not attach to it; see daemon.log")
+        if frames:
+            tab["frames"] = frames
+    elif frames and str(tab.get("host", "")).startswith("%") and pane_frames(tab["host"]) != frames:
+        tab["warning"] = (
+            f"pane {tab['host']} was started without {frames} frames, so the current viewer cannot see it; "
+            "close the pane and open again"
+        )
     if args.tile:
         do_tile()
     if args.json:
         return tab
-    notes = [n for n in ("reused" if tab.get("reused") else "", f"watching {tab['watching']}" if tab.get("watching") else "") if n]
+    if tab.get("warning"):
+        print(f"chromium-bridge: {tab['warning']}", file=sys.stderr)
+    notes = [n for n in (
+        "reused" if tab.get("reused") else "",
+        f"watching {tab['watching']}" if tab.get("watching") else "",
+        f"{tab['frames']} frames" if tab.get("frames") else "",
+    ) if n]
     return f"{tab['id']}  {tab.get('file') or tab['url']}" + (f"  ({', '.join(notes)})" if notes else "")
 
 
